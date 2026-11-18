@@ -25,6 +25,7 @@ import pytest
 from octop_gateway.channels.feishu import FeishuChannel, FeishuConfig
 from octop_gateway.channels.feishu_dedup import FeishuDedupStore
 from octop_gateway.constraints import ChannelConstraints
+from octop_gateway.inbox import SqliteInbox
 from octop_gateway.models import (
     ChannelSubject,
     FileContent,
@@ -360,6 +361,27 @@ class TestFeishuChannelUnit:
         assert len(enqueued) == 1
         assert channel.dropped_stale == 0
         assert channel.last_inbound_at is not None
+
+    @pytest.mark.asyncio
+    async def test_worker_acknowledges_stale_message_without_storing_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "180")
+        monkeypatch.delenv("OCTOP_FEISHU_DEDUP_DB", raising=False)
+        channel = FeishuChannel(processor=_noop_processor, config=_make_config(), channel_id="ch-worker-stale")
+        channel._running = True
+        store = SqliteInbox(tmp_path / "inbox.sqlite3")
+        channel.inbound_store = store
+        frame = {
+            "event": {
+                "message": {"message_id": "om_worker_stale", "create_time": str(int((time.time() - 3600) * 1000))},
+                "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_user"}},
+            }
+        }
+
+        assert await channel._on_worker_message(frame)
+        assert channel.dropped_stale == 1
+        assert store.pending(channel.inbound_scope) == []
 
     def test_age_gate_can_be_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OCTOP_FEISHU_MAX_MSG_AGE_SECONDS", "0")

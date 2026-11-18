@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import quote
 
@@ -30,6 +31,8 @@ from octop_gateway.channels.feishu_dedup import (
     open_dedup_store,
     resolve_dedup_db_path,
 )
+from octop_gateway.channels.feishu_ws_supervisor import FeishuWSSupervisor, find_worker
+from octop_gateway.inbox import SqliteInbox
 from octop_gateway.models import (
     AudioContent,
     ChannelSubject,
@@ -81,6 +84,7 @@ class FeishuConfig(ChannelConfig):
     encrypt_key: str = ""
     # Empty uses OCTOP_FEISHU_DEDUP_DB. When that is also empty, dedup stays in memory.
     dedup_db_path: str = ""
+    probe_mode: str = "full"
 
     required_credentials = ("app_id", "app_secret")
 
@@ -121,6 +125,9 @@ class FeishuChannel(BaseChannel):
         self._tenant_token: str = ""
         self._token_expires_at: float = 0.0
         self._token_lock = asyncio.Lock()
+        self._ws_supervisor: FeishuWSSupervisor | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._message_tasks: set[asyncio.Task[None]] = set()
         self._ws_client: Any = None
         self._ws_thread: Any = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
@@ -139,6 +146,11 @@ class FeishuChannel(BaseChannel):
         # restarts when Octop (or OCTOP_FEISHU_DEDUP_DB) supplies a path.
         dedup_path = resolve_dedup_db_path(config.dedup_db_path)
         self._dedup_store = open_dedup_store(dedup_path) if dedup_path else None
+        self._inbox_path = (
+            Path(dedup_path).expanduser().with_name("feishu-inbox.sqlite3")
+            if dedup_path
+            else Path.home() / ".octop-gateway" / "feishu-inbox.sqlite3"
+        )
 
     # =========================================================================
     # Lifecycle
@@ -146,24 +158,89 @@ class FeishuChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start the Feishu channel: refresh token and connect WebSocket."""
+        async with self._lifecycle_lock:
+            await self._start_channel()
+
+    async def _start_channel(self) -> None:
+        if self._running:
+            return
         self._running = True
         self._main_loop = asyncio.get_running_loop()
-        await self._refresh_token()
-        await self._ensure_bot_open_id()
-        await self._start_ws_client()
-        self._ws_watchdog_task = asyncio.create_task(
-            self._ws_watchdog_loop(),
-            name=f"feishu-ws-watchdog-{self.channel_id}",
-        )
+        try:
+            await self._refresh_token()
+            if self._config.probe_mode == "token":
+                return
+            await self._ensure_bot_open_id()
+            worker = find_worker()
+            if worker is not None:
+                if self._admit_callback is not None:
+                    self.inbound_store = SqliteInbox(self._inbox_path)
+                supervisor = FeishuWSSupervisor(
+                    worker,
+                    app_id=self._config.app_id,
+                    app_secret=self._config.app_secret,
+                    verification_token=self._config.verification_token,
+                    encrypt_key=self._config.encrypt_key,
+                    on_ready=self._on_worker_ready,
+                    on_message=self._on_worker_message,
+                )
+                supervisor.start()
+                self._ws_supervisor = supervisor
+                if self.inbound_store is not None:
+                    recovered = await asyncio.to_thread(self.inbound_store.recover, self.inbound_scope)
+                    if recovered:
+                        logger.warning(
+                            "Feishu receipts need reconciliation: app_id=%s count=%d", self.inbound_scope, recovered
+                        )
+                    await asyncio.to_thread(self.inbound_store.prune, time.time() - 7 * DEDUP_TTL_SECONDS)
+            else:
+                await self._start_ws_client()
+                self._ws_watchdog_task = asyncio.create_task(
+                    self._ws_watchdog_loop(),
+                    name=f"feishu-ws-watchdog-{self.channel_id}",
+                )
+        except BaseException:
+            await self._stop_channel()
+            raise
         logger.info("FeishuChannel started (app_id=%s)", self._config.app_id)
 
     async def stop(self) -> None:
         """Stop the Feishu channel: disconnect and cleanup."""
+        async with self._lifecycle_lock:
+            await self._stop_channel()
+
+    async def _stop_channel(self) -> None:
         self._running = False
-        await self._cancel_watchdog()
-        await self._stop_ws_client(force=True)
-        await self._close_http()
+        try:
+            if self._ws_supervisor is not None:
+                await self._ws_supervisor.stop()
+                self._ws_supervisor = None
+                self._ws_session_id = None
+            else:
+                await self._cancel_watchdog()
+                await self._stop_ws_client(force=True)
+        finally:
+            for task in self._message_tasks:
+                task.cancel()
+            if self._message_tasks:
+                await asyncio.gather(*self._message_tasks, return_exceptions=True)
+            await self._close_http()
         logger.info("FeishuChannel stopped")
+
+    def health_metrics(self) -> dict[str, Any]:
+        metrics = super().health_metrics()
+        if self._ws_supervisor is not None:
+            metrics.update(self._ws_supervisor.health_metrics())
+        return metrics
+
+    @property
+    def inbound_scope(self) -> str:
+        return self._config.app_id
+
+    def _on_worker_ready(self) -> None:
+        if self._ws_session_id is not None:
+            self.note_reconnect()
+        self._ws_session_id = str(uuid.uuid4())
 
     async def _ensure_bot_open_id(self) -> str | None:
         """Resolve and cache this bot's open_id via ``/bot/v3/info``."""
@@ -522,7 +599,7 @@ class FeishuChannel(BaseChannel):
                 return
 
             message_id = str(getattr(message, "message_id", "") or "")
-            if self._drop_if_stale(message, message_id):
+            if self._drop_if_stale(getattr(message, "create_time", None), message_id):
                 return
             if message_id and self._is_duplicate(message_id):
                 self.dropped_duplicate += 1
@@ -581,6 +658,89 @@ class FeishuChannel(BaseChannel):
             # SDK callbacks must not leak exceptions into the WebSocket dispatch thread.
             logger.exception("Error handling Feishu message event")
 
+    async def _on_worker_message(self, frame: dict[str, Any]) -> bool:
+        """Return a positive receipt only after the gateway has accepted the message."""
+        if not self._running:
+            return False
+        event = frame.get("event") or {}
+        message = event.get("message") or {}
+        sender = event.get("sender") or {}
+        if not message or not sender:
+            return False
+        sender_type = sender.get("sender_type") or ""
+        if sender_type == "bot":
+            return True
+        message_id = str(message.get("message_id") or "")
+        if not message_id:
+            return False
+        if self._drop_if_stale(message.get("create_time"), message_id):
+            return True
+
+        inbox = self.inbound_store
+        key = (self.channel_id, message_id)
+        already_seen = False
+        if inbox is None:
+            with self._shared_seen_lock:
+                already_seen = key in self._shared_seen_ids
+        store = self._dedup_store
+        if not already_seen and store is not None:
+            try:
+                already_seen = await asyncio.to_thread(
+                    store.contains, self.channel_id, message_id, since=time.time() - DEDUP_TTL_SECONDS
+                )
+            except (OSError, sqlite3.Error):
+                logger.warning("Feishu dedup lookup failed for %s", message_id, exc_info=True)
+                return False
+        if not self._running:
+            return False
+        if already_seen:
+            self.dropped_duplicate += 1
+            return True
+
+        sender_id = str((sender.get("sender_id") or {}).get("open_id") or "").strip()
+        payload = {
+            "message_id": message_id,
+            "message_type": message.get("message_type", "text"),
+            "content": message.get("content", "{}"),
+            "chat_id": message.get("chat_id", ""),
+            "chat_type": message.get("chat_type", "p2p"),
+            "thread_id": message.get("thread_id", ""),
+            "mentions": self._normalize_mentions(message.get("mentions")),
+            "sender": {"sender_id": sender_id, "sender_type": sender_type},
+            "create_time": frame.get("create_time") or message.get("create_time", ""),
+        }
+        if inbox is not None:
+            fresh = await asyncio.to_thread(inbox.accept, self.inbound_scope, message_id, payload)
+            if not fresh:
+                self.dropped_duplicate += 1
+                return True
+            # The durable receipt remains pending even if the gateway is stopping.
+            if self._admit_callback is not None:
+                self._admit_callback(payload)
+        elif self._admit_callback is not None:
+            if not self._admit_callback(payload):
+                return False
+        elif self._enqueue_callback is not None:
+            self._enqueue_callback(payload)
+        else:
+            task = asyncio.create_task(self.handle_inbound(payload), name=f"feishu-message-{message_id}")
+            self._message_tasks.add(task)
+            task.add_done_callback(self._message_tasks.discard)
+        if inbox is None:
+            self._remember(message_id)
+        self.note_inbound()
+        self._add_reaction_async(message_id, "Typing")
+        logger.info("Feishu worker message accepted: app_id=%s message_id=%s", self._config.app_id, message_id)
+
+        if inbox is None and store is not None:
+            try:
+                await asyncio.to_thread(
+                    store.already_seen, self.channel_id, message_id, now=time.time(), ttl_seconds=DEDUP_TTL_SECONDS
+                )
+            except (OSError, sqlite3.Error):
+                logger.warning("Feishu dedup recording failed for %s", message_id, exc_info=True)
+        return True
+
     @staticmethod
     def _normalize_mentions(raw_mentions: Any) -> list[dict[str, str]]:
         """Convert Feishu SDK mention objects into plain dicts for parse_inbound."""
@@ -620,7 +780,7 @@ class FeishuChannel(BaseChannel):
     # Deduplication
     # =========================================================================
 
-    def _drop_if_stale(self, message: Any, message_id: str) -> bool:
+    def _drop_if_stale(self, create_time: Any, message_id: str) -> bool:
         """Return True when the message's own create_time is past the age gate.
 
         A normal return (no exception) lets lark-oapi acknowledge the event,
@@ -629,7 +789,7 @@ class FeishuChannel(BaseChannel):
         limit = max_message_age_seconds()
         if limit <= 0:
             return False
-        created = message_create_time_seconds(getattr(message, "create_time", None))
+        created = message_create_time_seconds(create_time)
         if created is None:
             return False
         age = time.time() - created
