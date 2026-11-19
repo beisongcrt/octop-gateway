@@ -174,7 +174,9 @@ class FeishuChannel(BaseChannel):
             worker = find_worker()
             if worker is not None:
                 if self._admit_callback is not None:
-                    self.inbound_store = SqliteInbox(self._inbox_path)
+                    inbox = SqliteInbox(self._inbox_path)
+                    await asyncio.to_thread(inbox.establish_coverage, self.inbound_scope, time.time())
+                    self.inbound_store = inbox
                 supervisor = FeishuWSSupervisor(
                     worker,
                     app_id=self._config.app_id,
@@ -673,10 +675,11 @@ class FeishuChannel(BaseChannel):
         message_id = str(message.get("message_id") or "")
         if not message_id:
             return False
-        if self._drop_if_stale(message.get("create_time"), message_id):
+        inbox = self.inbound_store
+        created_at = message.get("create_time")
+        if not isinstance(inbox, SqliteInbox) and self._drop_if_stale(created_at, message_id):
             return True
 
-        inbox = self.inbound_store
         key = (self.channel_id, message_id)
         already_seen = False
         if inbox is None:
@@ -710,7 +713,19 @@ class FeishuChannel(BaseChannel):
             "create_time": frame.get("create_time") or message.get("create_time", ""),
         }
         if inbox is not None:
-            fresh = await asyncio.to_thread(inbox.accept, self.inbound_scope, message_id, payload)
+            sent_at = message_create_time_seconds(created_at)
+            if isinstance(inbox, SqliteInbox) and sent_at is not None and self._stale_message_age(sent_at) is not None:
+                outcome = await asyncio.to_thread(inbox.accept_late, self.inbound_scope, message_id, payload, sent_at)
+                if outcome == "recovery_required":
+                    logger.warning(
+                        "Feishu late message needs reconciliation: app_id=%s message_id=%s",
+                        self.inbound_scope,
+                        message_id,
+                    )
+                    return True
+                fresh = outcome == "pending"
+            else:
+                fresh = await asyncio.to_thread(inbox.accept, self.inbound_scope, message_id, payload)
             if not fresh:
                 self.dropped_duplicate += 1
                 return True
@@ -786,18 +801,19 @@ class FeishuChannel(BaseChannel):
         A normal return (no exception) lets lark-oapi acknowledge the event,
         which stops Feishu from retrying an old delivery.
         """
-        limit = max_message_age_seconds()
-        if limit <= 0:
-            return False
-        created = message_create_time_seconds(create_time)
-        if created is None:
-            return False
-        age = time.time() - created
-        if age <= limit:
+        sent_at = message_create_time_seconds(create_time)
+        age = self._stale_message_age(sent_at) if sent_at is not None else None
+        if age is None:
             return False
         self.dropped_stale += 1
         logger.warning("Feishu dropped stale message: id=%s age=%.0fs", message_id, age)
         return True
+
+    @staticmethod
+    def _stale_message_age(sent_at: float) -> float | None:
+        limit = max_message_age_seconds()
+        age = time.time() - sent_at
+        return age if 0 < limit < age else None
 
     def _is_duplicate(self, message_id: str) -> bool:
         """Check if a message_id has been seen recently.

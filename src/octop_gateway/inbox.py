@@ -100,19 +100,44 @@ class SqliteInbox:
         self._initialized = False
 
     def accept(self, scope: str, message_id: str, payload: dict[str, Any]) -> bool:
+        return self._accept(scope, message_id, payload) != "duplicate"
+
+    def establish_coverage(self, scope: str, since: float) -> None:
+        """Record when this app first began reliably persisting inbound receipts."""
+        with self._connection() as connection:
+            connection.execute("INSERT OR IGNORE INTO inbound_coverage VALUES (?, ?)", (scope, since))
+
+    def accept_late(
+        self, scope: str, message_id: str, payload: dict[str, Any], sent_at: float
+    ) -> Literal["pending", "recovery_required", "duplicate"]:
+        """Queue a delayed first delivery only while the receipt history covers its send time."""
+        return self._accept(scope, message_id, payload, sent_at=sent_at)
+
+    def _accept(
+        self, scope: str, message_id: str, payload: dict[str, Any], *, sent_at: float | None = None
+    ) -> Literal["pending", "recovery_required", "duplicate"]:
         self._validate_key(scope, message_id)
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         now = time.time()
         with self._connection() as connection:
+            status: Literal["pending", "recovery_required"] = "pending"
+            if sent_at is not None:
+                # The coverage read and receipt insert must be serialized with pruning.
+                connection.execute("BEGIN IMMEDIATE")
+                coverage = connection.execute(
+                    "SELECT covered_since FROM inbound_coverage WHERE scope = ?", (scope,)
+                ).fetchone()
+                if coverage is None or sent_at < coverage["covered_since"]:
+                    status = "recovery_required"
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO inbound_events
                     (scope, message_id, payload_json, status, created_at, updated_at)
-                VALUES (?, ?, ?, 'pending', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (scope, message_id, payload_json, now, now),
+                (scope, message_id, payload_json, status, now, now),
             )
-        return cursor.rowcount == 1
+        return status if cursor.rowcount == 1 else "duplicate"
 
     def pending(self, scope: str, limit: int = 100, offset: int = 0) -> list[InboxEntry]:
         if limit < 1:
@@ -223,6 +248,7 @@ class SqliteInbox:
                 f"DELETE FROM inbound_events WHERE status IN ({placeholders}) AND updated_at < ?",
                 (*_PRUNABLE_STATUSES, before),
             )
+            connection.execute("UPDATE inbound_coverage SET covered_since = MAX(covered_since, ?)", (before,))
         return cursor.rowcount
 
     @contextmanager
@@ -259,6 +285,10 @@ class SqliteInbox:
                 );
                 CREATE INDEX IF NOT EXISTS idx_inbound_events_ready
                     ON inbound_events (scope, status, created_at);
+                CREATE TABLE IF NOT EXISTS inbound_coverage (
+                    scope TEXT PRIMARY KEY,
+                    covered_since REAL NOT NULL
+                );
                 """
             )
             connection.commit()

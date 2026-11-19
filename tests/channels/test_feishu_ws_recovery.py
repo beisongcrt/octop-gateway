@@ -183,3 +183,17 @@ def test_inbox_replays_pending_but_quarantines_interrupted_work(tmp_path: Path) 
     assert [entry.message_id for entry in reopened.entries("bot", "recovery_required")] == ["started"]
     assert not reopened.accept("bot", "started", {"message_id": "started"})
     assert reopened.accept("other-app", "started", {"message_id": "started"})
+
+
+def test_pruning_advances_late_delivery_coverage_without_resetting_on_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    store = SqliteInbox(path)
+    store.establish_coverage("bot", 100.0)
+    store.establish_coverage("other-bot", 300.0)
+    store.prune(200.0)
+
+    reopened = SqliteInbox(path)
+    reopened.establish_coverage("bot", 100.0)
+    assert reopened.accept_late("bot", "old", {"message_id": "old"}, 199.0) == "recovery_required"
+    assert reopened.accept_late("bot", "new", {"message_id": "new"}, 201.0) == "pending"
+    assert reopened.accept_late("other-bot", "new", {"message_id": "new"}, 201.0) == "recovery_required"
