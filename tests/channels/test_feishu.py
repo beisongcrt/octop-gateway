@@ -18,7 +18,7 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -26,6 +26,7 @@ from octop_gateway.channels.feishu import FeishuChannel, FeishuConfig
 from octop_gateway.channels.feishu_dedup import FeishuDedupStore
 from octop_gateway.constraints import ChannelConstraints
 from octop_gateway.inbox import SqliteInbox
+from octop_gateway.media import FileSystemMediaBackend
 from octop_gateway.models import (
     ChannelSubject,
     FileContent,
@@ -125,6 +126,79 @@ class TestFeishuChannelUnit:
         assert len(images) == 1
         assert images[0].url is not None
         assert "img_v2_post" in images[0].url
+
+    @pytest.mark.asyncio
+    async def test_prepare_post_with_file_attachments(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        backend = FileSystemMediaBackend(tmp_path)
+        ch.set_media_backend(backend)
+        documents = [b"Word attachment", b"%PDF-1.7 attachment"]
+        mime_types = [
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/pdf",
+        ]
+        download = AsyncMock(side_effect=list(zip(documents, mime_types, strict=True)))
+        monkeypatch.setattr(ch, "fetch_remote_media", download)
+        prepared = await ch._prepare_inbound(
+            {
+                "message_id": "om_post_files",
+                "message_type": "post",
+                "content": json.dumps(
+                    {
+                        "content": [[{"tag": "text", "text": "Please review these documents."}]],
+                        "files": [
+                            {"file_key": "file_v2_first", "file_name": "测试 文档.docx", "is_folder": False},
+                            {"file_key": "file_v2_second", "file_name": "second.pdf", "is_folder": False},
+                        ],
+                    }
+                ),
+                "chat_id": "oc_post",
+                "chat_type": "p2p",
+                "sender": {"sender_id": "ou_post_user", "sender_type": "user"},
+            }
+        )
+        assert prepared is not None
+        message, _ = prepared
+        assert message.text == "Please review these documents."
+        files = [part for part in message.content if isinstance(part, FileContent)]
+        assert [part.filename for part in files] == ["测试 文档.docx", "second.pdf"]
+        assert [part.mime_type for part in files] == mime_types
+        for part, document in zip(files, documents, strict=True):
+            assert part.local_path
+            assert await backend.read(part.local_path) == document
+        urls = [call.args[0] for call in download.await_args_list]
+        assert len(urls) == 2
+        assert urls[0].endswith("/messages/om_post_files/resources/file_v2_first?type=file")
+        assert urls[1].endswith("/messages/om_post_files/resources/file_v2_second?type=file")
+
+    def test_extract_localized_post_attachments_deduplicates_inline_media(self) -> None:
+        content = {
+            "files": [{"file_key": "file_v2_inline", "file_name": "inline.mp4"}],
+            "zh_cn": {
+                "content": [[{"tag": "text", "text": "正文"}, {"tag": "media", "file_key": "file_v2_inline"}]],
+                "files": [
+                    {"file_key": "file_v2_inline", "file_name": "inline.mp4"},
+                    {"file_key": "file_v2_extra", "file_name": "extra.docx"},
+                    {"file_key": "file_v2_folder", "is_folder": True},
+                    {"file_name": "missing-key.docx"},
+                ],
+            },
+        }
+        text, parts = FeishuChannel._extract_post_parts(content, message_id="om_localized")
+        assert text == "正文"
+        assert len(parts) == 2
+        assert [part.filename for part in parts if isinstance(part, FileContent)] == ["inline.mp4", "extra.docx"]
+
+    def test_parse_post_with_only_file_attachments(self) -> None:
+        ch = FeishuChannel(processor=_noop_processor, config=_make_config())
+        parts = ch._parse_content_parts(
+            "post",
+            {"files": [{"file_key": "file_v2_only", "file_name": "only.docx"}]},
+            message_id="om_post_only",
+        )
+        assert len(parts) == 1
+        assert isinstance(parts[0], FileContent)
+        assert parts[0].filename == "only.docx"
 
     def test_parse_inbound_group_mention_sets_bot_mentioned(self) -> None:
         ch = FeishuChannel(processor=_noop_processor, config=_make_config())
